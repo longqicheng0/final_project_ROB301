@@ -1,9 +1,10 @@
-
 #!/usr/bin/env python3
 
 import rclpy
+from geometry_msgs.msg import TwistStamped
 from rclpy.node import Node
-from std_msgs.msg import Float64MultiArray
+from std_msgs.msg import Float64MultiArray, UInt32
+
 
 class FinalProject(Node):
     def __init__(self):
@@ -19,6 +20,12 @@ class FinalProject(Node):
             "floor":  (160, 150, 140)
         }
 
+        # Proportional line-following settings
+        self.line_center = 320
+        self.linear_speed = 0.1
+        self.k_p = 0.004
+        self.line_index = None
+
         self.create_subscription(
             Float64MultiArray,
             '/mean_img_rgb',
@@ -26,12 +33,41 @@ class FinalProject(Node):
             10
         )
 
+        self.create_subscription(
+            UInt32,
+            '/line_idx',
+            self.line_callback,
+            10
+        )
+        self.cmd_pub = self.create_publisher(
+            TwistStamped,
+            '/cmd_vel',
+            10
+        )
+        self.control_timer = self.create_timer(0.05, self.control_loop)
+
         self.surface = None
         self.candidate = None
         self.stable_count = 0
         self.office_count = 0
 
         self.get_logger().info('Final Project initialized.')
+
+    def line_callback(self, msg):
+        self.line_index = msg.data
+
+    def control_loop(self):
+        if self.line_index is None:
+            return
+
+        error = self.line_index - self.line_center
+
+        command = TwistStamped()
+        command.header.stamp = self.get_clock().now().to_msg()
+        command.twist.linear.x = self.linear_speed
+        command.twist.angular.z = -self.k_p * error
+
+        self.cmd_pub.publish(command)
 
     def classify_surface(self, r, g, b):
         rgb = (r, g, b)
