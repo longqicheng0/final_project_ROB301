@@ -25,6 +25,7 @@ class FinalProject(Node):
         self.linear_speed = 0.1
         self.k_p = 0.004
         self.line_index = None
+        self.rgb_value = None
 
         self.create_subscription(
             Float64MultiArray,
@@ -45,18 +46,39 @@ class FinalProject(Node):
             10
         )
         self.control_timer = self.create_timer(0.05, self.control_loop)
+        self.status_timer = self.create_timer(1.0, self.log_status)
 
         self.surface = None
         self.candidate = None
         self.stable_count = 0
         self.office_count = 0
+        self.office_target = 11
+        self.was_patch = True
+        self.done = False
 
         self.get_logger().info('Final Project initialized.')
 
     def line_callback(self, msg):
         self.line_index = msg.data
 
+    def log_status(self):
+        surface = {
+            "OFFICE": "PATCH",
+            "PATH": "LINE"
+        }.get(self.surface, "UNKNOWN")
+
+        self.get_logger().info(
+            f"surface={surface} rgb={self.rgb_value} "
+            f"line_idx={self.line_index} office_count={self.office_count}"
+        )
+
     def control_loop(self):
+        if self.done:
+            stop_command = TwistStamped()
+            stop_command.header.stamp = self.get_clock().now().to_msg()
+            self.cmd_pub.publish(stop_command)
+            return
+
         if self.line_index is None:
             return
 
@@ -98,7 +120,12 @@ class FinalProject(Node):
         if len(msg.data) < 3:
             return
 
-        detected = self.classify_surface(*msg.data[:3])
+        self.rgb_value = tuple(msg.data[:3])
+
+        if self.done:
+            return
+
+        detected = self.classify_surface(*self.rgb_value)
 
         # Require 4 consistent readings
         if detected == self.candidate:
@@ -113,17 +140,24 @@ class FinalProject(Node):
         if detected == "UNKNOWN" or detected == self.surface:
             return
 
-        previous = self.surface
         self.surface = detected
 
         self.get_logger().info(f"Surface: {detected}")
 
-        # Count only PATH -> OFFICE transitions
-        if previous == "PATH" and detected == "OFFICE":
+        is_patch = detected == "OFFICE"
+
+        # Starting on an office does not count as a new entry.
+        if is_patch and not self.was_patch:
             self.office_count += 1
             self.get_logger().info(
                 f"Office entered: {self.office_count}"
             )
+
+            if self.office_count >= self.office_target:
+                self.done = True
+                self.get_logger().info('11 offices reached. Stopping.')
+
+        self.was_patch = is_patch
 
 
 def main():
