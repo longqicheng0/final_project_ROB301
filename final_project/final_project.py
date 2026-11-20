@@ -32,7 +32,7 @@ STABLE_READINGS = 4
 # --- 1.2 Line Following ---
 
 LINE_CENTER = 320
-LINEAR_SPEED = 0.10
+LINEAR_SPEED = 0.06
 LINE_KP = 0.004
 
 
@@ -42,14 +42,7 @@ CONTROL_PERIOD = 0.05
 STATUS_PERIOD = 1.0
 
 
-# --- 1.4 Route Testing ---
-
-# Set to None for continuous localization testing.
-# Set to 11 to stop after 11 confirmed office entries.
-PATCH_COUNT_LIMIT = 11
-
-
-# --- 1.5 ROS Topics ---
+# --- 1.4 ROS Topics ---
 
 RGB_TOPIC = '/mean_img_rgb'
 LINE_TOPIC = '/line_idx'
@@ -65,8 +58,8 @@ ESTIMATE_TOPIC = '/estimated_office'
 
 OFFICES = np.arange(2, 13)
 
-# Practice topology: office 2 through office 12.
-# Replace with the final map when announced.
+# Practice topology: offices 2 through 12.
+# Replace with final map when announced.
 TOPOLOGY_COLORS = [
     "yellow", "green", "blue",
     "orange", "orange", "green",
@@ -75,9 +68,9 @@ TOPOLOGY_COLORS = [
 ]
 
 MOTION_MODEL = {
-    -1: (0.85, 0.10, 0.05),
-     0: (0.05, 0.90, 0.05),
-     1: (0.05, 0.10, 0.85)
+    -1: (0.95, 0.02, 0.03),
+     0: (0.02, 0.96, 0.02),
+     1: (0.03, 0.02, 0.55)
 }
 
 SENSOR_MODEL = {
@@ -104,12 +97,11 @@ class BayesianLocalizer:
 
     def __init__(self):
 
-        n = len(OFFICES)
-
         # Uniform initial belief.
+        n = len(OFFICES)
         self.belief = np.full(n, 1.0 / n)
 
-        # Save history for debugging and plotting.
+        # History for debugging and plotting.
         self.history = [self.belief.copy()]
 
     def update(self, observed_color, moved_forward):
@@ -158,7 +150,6 @@ class BayesianLocalizer:
         # ----------------------------------------
 
         posterior = prediction * likelihood
-
         total = posterior.sum()
 
         if total <= 0:
@@ -167,7 +158,6 @@ class BayesianLocalizer:
             )
 
         self.belief = posterior / total
-
         self.history.append(self.belief.copy())
 
         # ----------------------------------------
@@ -195,21 +185,21 @@ class FinalProject(Node):
         # 4.1 Robot State
         # ----------------------------------------------------
 
+        # Latest sensor measurements.
         self.line_index = None
         self.rgb_value = None
         self.predicted_color = None
 
-        # Surface state: OFFICE, PATH, UNKNOWN
+        # Current surface: OFFICE, PATH, UNKNOWN.
         self.surface = None
 
-        # Surface detection debounce.
+        # Surface classification debounce.
         self.candidate_detection = None
         self.confirmed_detection = None
         self.stable_count = 0
 
-        # Office entry detection.
+        # Office detection.
         self.ready_for_next_office = False
-        self.office_count = 0
 
         # Initial Bayesian observation.
         self.initial_observation_done = False
@@ -286,7 +276,7 @@ class FinalProject(Node):
     # ========================================================
 
     def line_callback(self, msg):
-        """Store the latest detected white-line position."""
+        """Store the latest white-line position."""
 
         self.line_index = msg.data
 
@@ -294,12 +284,10 @@ class FinalProject(Node):
         """
         Process RGB measurements.
 
-        1. Classify the surface and color.
+        1. Classify surface and color.
         2. Confirm stable measurements.
-        3. Detect PATH -> OFFICE transitions.
-        4. Handle initial office observation separately.
-
-        Only PATH -> OFFICE increments office_count.
+        3. Detect valid PATH -> OFFICE transitions.
+        4. Handle initial observation separately.
         """
 
         if len(msg.data) < 3:
@@ -315,7 +303,7 @@ class FinalProject(Node):
             return
 
         # ----------------------------------------
-        # 1. Preserve detected office color
+        # 1. Preserve observed office color
         # ----------------------------------------
 
         observed_color = (
@@ -344,7 +332,6 @@ class FinalProject(Node):
             return
 
         self.confirmed_detection = detection
-
         self.surface = detected
 
         self.get_logger().info(
@@ -359,7 +346,7 @@ class FinalProject(Node):
         if detected == "PATH":
 
             # A confirmed PATH allows the next office
-            # to be counted as a new office entry.
+            # to trigger a new localization event.
             self.ready_for_next_office = True
 
         # ----------------------------------------
@@ -368,29 +355,34 @@ class FinalProject(Node):
 
         elif detected == "OFFICE":
 
-            if self.ready_for_next_office:
+            if not self.initial_observation_done:
 
-                # Valid PATH -> OFFICE transition.
+                # First confirmed office observation.
+                #
+                # It may be the starting patch, or the
+                # first patch encountered from the path.
+                #
+                # Measurement update only.
+                self.handle_initial_observation(
+                    observed_color
+                )
+
+                # The current patch has been processed.
+                self.ready_for_next_office = False
+
+            elif self.ready_for_next_office:
+
+                # Valid transition to the next office.
                 self.ready_for_next_office = False
 
                 self.handle_office_entry(
                     observed_color
                 )
 
-            elif not self.initial_observation_done:
-
-                # Robot starts directly on an office.
-                #
-                # Observe its color to initialize
-                # the belief, but DO NOT count entry.
-                self.handle_initial_observation(
-                    observed_color
-                )
-
         # UNKNOWN:
-        # Do not change the entry-ready flag.
-        # Brief UNKNOWN readings are ignored for
-        # the purpose of detecting an office entry.
+        # Preserve ready_for_next_office so that brief
+        # unknown readings do not cancel a valid
+        # office entry.
 
     # ========================================================
     # 6. SURFACE CLASSIFICATION
@@ -455,13 +447,11 @@ class FinalProject(Node):
 
     def handle_initial_observation(self, observed_color):
         """
-        Called when the robot starts on an office patch.
+        Process the first confirmed office color.
 
-        Update belief using the observed color,
-        without motion prediction.
-
-        IMPORTANT:
-            office_count remains unchanged.
+        Only perform the measurement update.
+        No motion prediction is required because
+        the initial belief is uniform.
         """
 
         self.get_logger().info(
@@ -482,69 +472,23 @@ class FinalProject(Node):
 
     def handle_office_entry(self, observed_color):
         """
-        Called only after a confirmed PATH -> OFFICE.
+        Called after a confirmed transition to
+        the next office.
 
-        1. Increment office count.
-        2. Perform Bayesian update.
+        1. Perform motion prediction.
+        2. Apply observed color measurement.
         3. Publish localization results.
-        4. Check route test completion.
         """
-
-        # ----------------------------------------
-        # 1. Count office entry
-        # ----------------------------------------
-
-        self.office_count += 1
-
-        # ----------------------------------------
-        # 2. Bayesian localization
-        # ----------------------------------------
-
-        # If an initial office was observed:
-        #     Predict one forward movement.
-        #
-        # Otherwise:
-        #     This is the first observation.
-        #     Use measurement update only.
-
-        moved_forward = self.initial_observation_done
 
         estimated_office, confidence = self.localizer.update(
             observed_color,
-            moved_forward=moved_forward
+            moved_forward=True
         )
-
-        self.initial_observation_done = True
-
-        # ----------------------------------------
-        # 3. Publish localization
-        # ----------------------------------------
 
         self.publish_localization(
             estimated_office,
             confidence
         )
-
-        self.get_logger().info(
-            f'Office entry count: {self.office_count}'
-        )
-
-        # ----------------------------------------
-        # 4. Temporary route testing condition
-        # ----------------------------------------
-
-        if (
-            PATCH_COUNT_LIMIT is not None
-            and self.office_count >= PATCH_COUNT_LIMIT
-        ):
-
-            self.done = True
-
-            self.get_logger().info(
-                'Full route count reached. Stopping.'
-            )
-
-            self.stop_robot()
 
     def publish_localization(self, estimated_office, confidence):
         """
@@ -555,17 +499,16 @@ class FinalProject(Node):
         self.localization_confidence = confidence
 
         # ----------------------------------------
-        # 1. Full probability distribution
+        # 1. Publish full probability distribution
         # ----------------------------------------
 
         belief_msg = Float64MultiArray()
-
         belief_msg.data = self.localizer.belief.tolist()
 
         self.belief_pub.publish(belief_msg)
 
         # ----------------------------------------
-        # 2. Estimated office
+        # 2. Publish estimated office
         # ----------------------------------------
 
         estimate_msg = UInt32()
@@ -574,7 +517,7 @@ class FinalProject(Node):
         self.estimate_pub.publish(estimate_msg)
 
         # ----------------------------------------
-        # 3. Log belief
+        # 3. Log localization results
         # ----------------------------------------
 
         self.get_logger().info(
@@ -641,7 +584,7 @@ class FinalProject(Node):
         )
 
         self.cmd_pub.publish(command)
-
+    
     # ========================================================
     # 9. DEBUG / STATUS LOGGING
     # ========================================================
@@ -654,12 +597,14 @@ class FinalProject(Node):
             f'rgb={self.rgb_value} '
             f'predicted_color={self.predicted_color} '
             f'line_idx={self.line_index} '
-            f'office_count={self.office_count} '
+            f'ready_for_next_office={self.ready_for_next_office} '
             f'initial_observed={self.initial_observation_done} '
+            f'office_belief={np.round(self.localizer.belief, 3)} '
             f'estimated_office={self.estimated_office} '
             f'confidence={self.localization_confidence} '
             f'done={self.done}'
         )
+
 
 
 # ============================================================
