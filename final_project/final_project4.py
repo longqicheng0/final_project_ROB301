@@ -244,9 +244,6 @@ class FinalProject(Node):
         self.estimated_office = None
         self.localization_confidence = None
 
-        # Robot execution state.
-        self.done = False
-
         # ----------------------------------------------------
         # Mission execution state
         # ----------------------------------------------------
@@ -499,13 +496,11 @@ class FinalProject(Node):
     # 7. BAYESIAN LOCALIZATION INTEGRATION
     # ========================================================
 
+    
     def handle_initial_observation(self, observed_color):
         """
         Process the first confirmed office color.
-
-        Only perform the measurement update.
-        No motion prediction is required because
-        the initial belief is uniform.
+        Perform measurement update only.
         """
 
         self.get_logger().info(
@@ -524,6 +519,11 @@ class FinalProject(Node):
             confidence
         )
 
+        # Check whether delivery should begin.
+        self.check_delivery_target()
+
+
+    
     def handle_office_entry(self, observed_color):
         """
         Called after a confirmed transition to
@@ -532,6 +532,7 @@ class FinalProject(Node):
         1. Perform motion prediction.
         2. Apply observed color measurement.
         3. Publish localization results.
+        4. Check delivery eligibility.
         """
 
         estimated_office, confidence = self.localizer.update(
@@ -543,6 +544,10 @@ class FinalProject(Node):
             estimated_office,
             confidence
         )
+
+        # Check whether delivery should begin.
+        self.check_delivery_target()
+
 
     def publish_localization(self, estimated_office, confidence):
         """
@@ -898,21 +903,45 @@ class FinalProject(Node):
     # 9. DEBUG / STATUS LOGGING
     # ========================================================
 
+    
     def log_status(self):
         """Print robot state once per STATUS_PERIOD."""
 
+        elapsed = (
+            self.get_clock().now() - self.state_start_time
+        ).nanoseconds / 1e9
+
+        # Sensor and navigation status.
         self.get_logger().info(
+            f'[NAVIGATION] '
             f'surface={self.surface or "UNKNOWN"} '
             f'rgb={self.rgb_value} '
             f'predicted_color={self.predicted_color} '
             f'line_idx={self.line_index} '
-            f'ready_for_next_office={self.ready_for_next_office} '
+            f'ready_for_next_office={self.ready_for_next_office}'
+        )
+
+        # Bayesian localization status.
+        self.get_logger().info(
+            f'[LOCALIZATION] '
             f'initial_observed={self.initial_observation_done} '
             f'office_belief={np.round(self.localizer.belief, 3)} '
             f'estimated_office={self.estimated_office} '
-            f'confidence={self.localization_confidence} '
-            f'done={self.done}'
+            f'confidence={self.localization_confidence}'
         )
+
+        # Delivery mission status.
+        self.get_logger().info(
+            f'[MISSION] '
+            f'state={self.mission_state} '
+            f'state_elapsed={elapsed:.2f}s '
+            f'active_target={self.active_target} '
+            f'remaining={sorted(self.remaining_targets)} '
+            f'delivered={sorted(self.delivered_targets)} '
+            f'progress={len(self.delivered_targets)}/'
+            f'{len(DELIVERY_TARGETS)}'
+        )
+
 
 
 
