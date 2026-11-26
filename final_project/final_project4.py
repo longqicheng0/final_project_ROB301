@@ -51,6 +51,40 @@ CMD_TOPIC = '/cmd_vel'
 BELIEF_TOPIC = '/office_belief'
 ESTIMATE_TOPIC = '/estimated_office'
 
+# --- 1.5 Delivery Mission ---
+
+# Three office numbers assigned by the TA.
+DELIVERY_TARGETS = [3, 7, 11]
+
+# Minimum localization confidence required for delivery.
+LOCALIZATION_THRESHOLD = 0.85
+
+
+# --- 1.6 Delivery Maneuver ---
+
+# Time to allow the robot to come to rest.
+STOP_DURATION = 0.5
+
+# Time spent facing the office to simulate mail delivery.
+DELIVERY_PAUSE = 2.0
+
+# Angular velocity magnitude (rad/s).
+TURN_SPEED = 0.5
+
+# Duration of 90-degree rotations (seconds).
+TURN_LEFT_DURATION = np.pi / (2 * TURN_SPEED)
+TURN_RIGHT_DURATION = np.pi / (2 * TURN_SPEED)
+
+# --- 1.7 Mission State Definitions ---
+
+class MissionState:
+
+    NAVIGATING = "NAVIGATING"
+    STOPPING = "STOPPING"
+    TURNING_LEFT = "TURNING_LEFT"
+    DELIVERING = "DELIVERING"
+    TURNING_BACK = "TURNING_BACK"
+    MISSION_COMPLETE = "MISSION_COMPLETE"
 
 # ============================================================
 # 2. BAYESIAN LOCALIZATION CONFIGURATION
@@ -70,7 +104,7 @@ TOPOLOGY_COLORS = [
 MOTION_MODEL = {
     -1: (0.95, 0.02, 0.03),
      0: (0.02, 0.96, 0.02),
-     1: (0.03, 0.02, 0.55)
+     1: (0.03, 0.02, 0.95)
 }
 
 SENSOR_MODEL = {
@@ -214,6 +248,22 @@ class FinalProject(Node):
         self.done = False
 
         # ----------------------------------------------------
+        # Mission execution state
+        # ----------------------------------------------------
+
+        self.mission_state = MissionState.NAVIGATING
+
+        # Timestamp for timed state transitions.
+        self.state_start_time = self.get_clock().now()
+
+        # Delivery target management.
+        self.remaining_targets = set(DELIVERY_TARGETS)
+        self.delivered_targets = set()
+
+        # Office currently receiving a delivery.
+        self.active_target = None
+
+        # ----------------------------------------------------
         # 4.2 ROS Subscribers
         # ----------------------------------------------------
 
@@ -280,15 +330,22 @@ class FinalProject(Node):
 
         self.line_index = msg.data
 
+
     def rgb_callback(self, msg):
         """
         Process RGB measurements.
 
-        1. Classify surface and color.
-        2. Confirm stable measurements.
-        3. Detect valid PATH -> OFFICE transitions.
-        4. Handle initial observation separately.
+        1. Ignore measurements during delivery.
+        2. Classify surface and color.
+        3. Confirm stable measurements.
+        4. Detect valid PATH -> OFFICE transitions.
+        5. Handle initial observation separately.
         """
+
+        # Suspend perception and localization
+        # during delivery or mission completion.
+        if self.mission_state != MissionState.NAVIGATING:
+            return
 
         if len(msg.data) < 3:
             return
@@ -298,9 +355,6 @@ class FinalProject(Node):
         detected = self.classify_surface(
             *self.rgb_value
         )
-
-        if self.done:
-            return
 
         # ----------------------------------------
         # 1. Preserve observed office color
@@ -530,18 +584,229 @@ class FinalProject(Node):
             f'{np.round(self.localizer.belief, 3)}'
         )
 
+    
+    # ========================================================
+    # 7.1 DELIVERY DECISION AND MISSION MANAGEMENT
+    # ========================================================
+
+    def check_delivery_target(self):
+        """
+        Determine whether the robot should initiate delivery.
+        """
+
+        # Only initiate delivery while navigating.
+        if self.mission_state != MissionState.NAVIGATING:
+            return
+
+        # Robot must currently be on an office patch.
+        if self.surface != "OFFICE":
+            return
+
+        # Localization must be available.
+        if self.localization_confidence is None:
+            return
+
+        # Check whether the estimated office requires delivery.
+        if self.estimated_office not in self.remaining_targets:
+            return
+
+        # Reject uncertain localization.
+        if self.localization_confidence < LOCALIZATION_THRESHOLD:
+            return
+
+        # All conditions satisfied.
+        self.start_delivery(self.estimated_office)
+
+
+    def start_delivery(self, office):
+        """
+        Initialize the delivery maneuver at the target office.
+        """
+
+        self.active_target = office
+
+        self.set_mission_state(MissionState.STOPPING)
+
+        self.stop_robot()
+
+        self.get_logger().info(
+            f'Starting delivery at office {office}, '
+            f'confidence={self.localization_confidence:.3f}'
+        )
+
+
+    def set_mission_state(self, new_state):
+        """
+        Change mission state and reset the state timer.
+        """
+
+        previous_state = self.mission_state
+
+        self.mission_state = new_state
+        self.state_start_time = self.get_clock().now()
+
+        self.get_logger().info(
+            f'Mission state: {previous_state} -> {new_state}'
+        )
+
+
+    # ========================================================
+    # 7.2 TIMED DELIVERY EXECUTION
+    # ========================================================
+
+    def execute_delivery(self, command):
+        """
+        Execute the timed delivery maneuver.
+
+        STOPPING -> TURNING_LEFT -> DELIVERING
+        -> TURNING_BACK -> Finish delivery
+        """
+
+        elapsed = (
+            self.get_clock().now() - self.state_start_time
+        ).nanoseconds / 1e9
+
+        # Default: stationary robot.
+        command.twist.linear.x = 0.0
+        command.twist.angular.z = 0.0
+
+        # ----------------------------------------
+        # 1. Stop before rotating
+        # ----------------------------------------
+
+        if self.mission_state == MissionState.STOPPING:
+
+            if elapsed >= STOP_DURATION:
+                self.set_mission_state(
+                    MissionState.TURNING_LEFT
+                )
+
+        # ----------------------------------------
+        # 2. Complete left rotation
+        # ----------------------------------------
+
+        elif self.mission_state == MissionState.TURNING_LEFT:
+
+            if elapsed >= TURN_LEFT_DURATION:
+                self.set_mission_state(
+                    MissionState.DELIVERING
+                )
+
+        # ----------------------------------------
+        # 3. Pause to simulate delivery
+        # ----------------------------------------
+
+        elif self.mission_state == MissionState.DELIVERING:
+
+            if elapsed >= DELIVERY_PAUSE:
+                self.set_mission_state(
+                    MissionState.TURNING_BACK
+                )
+
+        # ----------------------------------------
+        # 4. Complete right rotation
+        # ----------------------------------------
+
+        elif self.mission_state == MissionState.TURNING_BACK:
+
+            if elapsed >= TURN_RIGHT_DURATION:
+                self.finish_delivery()
+                return
+
+        # ----------------------------------------
+        # 5. Generate motion command
+        # ----------------------------------------
+
+        if self.mission_state == MissionState.TURNING_LEFT:
+            command.twist.angular.z = TURN_SPEED
+
+        elif self.mission_state == MissionState.TURNING_BACK:
+            command.twist.angular.z = -TURN_SPEED
+
+
+    # ========================================================
+    # 7.3 DELIVERY COMPLETION
+    # ========================================================
+
+    def finish_delivery(self):
+        """
+        Complete the current delivery and determine
+        whether to resume navigation or stop.
+        """
+
+        # ----------------------------------------
+        # 1. Update delivery records
+        # ----------------------------------------
+
+        office = self.active_target
+
+        self.remaining_targets.remove(office)
+        self.delivered_targets.add(office)
+
+        self.active_target = None
+
+        self.get_logger().info(
+            f'Delivery completed at office {office}'
+        )
+
+        self.get_logger().info(
+            f'Delivered: {sorted(self.delivered_targets)}, '
+            f'Remaining: {sorted(self.remaining_targets)}'
+        )
+
+        # ----------------------------------------
+        # 2. Check mission completion
+        # ----------------------------------------
+
+        if not self.remaining_targets:
+
+            self.set_mission_state(
+                MissionState.MISSION_COMPLETE
+            )
+
+            self.get_logger().info(
+                'MISSION COMPLETE: All mail delivered.'
+            )
+
+            return
+
+        # ----------------------------------------
+        # 3. Reset sensor detection
+        # ----------------------------------------
+
+        self.surface = None
+        self.rgb_value = None
+        self.predicted_color = None
+        self.line_index = None
+
+        self.candidate_detection = None
+        self.confirmed_detection = None
+        self.stable_count = 0
+
+        # Require PATH before accepting another office.
+        self.ready_for_next_office = False
+
+        # ----------------------------------------
+        # 4. Resume navigation
+        # ----------------------------------------
+
+        self.set_mission_state(
+            MissionState.NAVIGATING
+        )
+
+
     # ========================================================
     # 8. MOTION CONTROL
     # ========================================================
 
+    
     def control_loop(self):
         """
-        Runs periodically.
+        Main motion controller.
 
-        OFFICE  -> drive forward to find white line
-        PATH    -> proportional line following
-        UNKNOWN -> stop
-        DONE    -> stop
+        NAVIGATING       -> Line-following controller
+        Delivery states  -> Timed delivery controller
+        MISSION_COMPLETE -> Stop
         """
 
         command = TwistStamped()
@@ -550,14 +815,59 @@ class FinalProject(Node):
             self.get_clock().now().to_msg()
         )
 
-        # Default command is zero velocity.
+        # ----------------------------------------
+        # 1. Navigation
+        # ----------------------------------------
 
-        if self.done:
-            pass
+        if self.mission_state == MissionState.NAVIGATING:
 
-        elif self.surface == "OFFICE":
+            self.navigate(command)
+
+        # ----------------------------------------
+        # 2. Mission completed
+        # ----------------------------------------
+
+        elif self.mission_state == MissionState.MISSION_COMPLETE:
+
+            command.twist.linear.x = 0.0
+            command.twist.angular.z = 0.0
+
+        # ----------------------------------------
+        # 3. Delivery maneuver
+        # ----------------------------------------
+
+        else:
+
+            self.execute_delivery(command)
+
+        # Publish the final velocity command.
+        self.cmd_pub.publish(command)
+
+    
+    def navigate(self, command):
+        """
+        Execute normal navigation.
+
+        OFFICE  -> Drive forward to find white line
+        PATH    -> Proportional line following
+        UNKNOWN -> Stop
+        """
+
+        # Default: stationary robot.
+        command.twist.linear.x = 0.0
+        command.twist.angular.z = 0.0
+
+        # ----------------------------------------
+        # 1. Drive through office patch
+        # ----------------------------------------
+
+        if self.surface == "OFFICE":
 
             command.twist.linear.x = LINEAR_SPEED
+
+        # ----------------------------------------
+        # 2. Follow white tape
+        # ----------------------------------------
 
         elif (
             self.surface == "PATH"
@@ -572,7 +882,6 @@ class FinalProject(Node):
                 -LINE_KP * error
             )
 
-        self.cmd_pub.publish(command)
 
     def stop_robot(self):
         """Publish a zero-velocity command."""
